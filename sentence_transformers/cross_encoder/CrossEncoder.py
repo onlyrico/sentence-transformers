@@ -41,8 +41,10 @@ class CrossEncoder(PushToHubMixin):
             length of the model will be used. Defaults to None.
         device (str, optional): Device that should be used for the model. If None, it will use CUDA if available.
             Defaults to None.
-        tokenizer_args (Dict, optional): Arguments passed to AutoTokenizer. Defaults to None.
         automodel_args (Dict, optional): Arguments passed to AutoModelForSequenceClassification. Defaults to None.
+        tokenizer_args (Dict, optional): Arguments passed to AutoTokenizer. Defaults to None.
+        config_args (Dict, optional): Arguments passed to AutoConfig. Defaults to None.
+        cache_dir (`str`, `Path`, optional): Path to the folder where cached files are stored.
         trust_remote_code (bool, optional): Whether or not to allow for custom models defined on the Hub in their own modeling files.
             This option should only be set to True for repositories you trust and in which you have read the code, as it
             will execute code present on the Hub on your local machine. Defaults to False.
@@ -61,8 +63,10 @@ class CrossEncoder(PushToHubMixin):
         num_labels: int = None,
         max_length: int = None,
         device: str | None = None,
-        tokenizer_args: dict = None,
         automodel_args: dict = None,
+        tokenizer_args: dict = None,
+        config_args: dict = None,
+        cache_dir: str = None,
         trust_remote_code: bool = False,
         revision: str | None = None,
         local_files_only: bool = False,
@@ -73,8 +77,15 @@ class CrossEncoder(PushToHubMixin):
             tokenizer_args = {}
         if automodel_args is None:
             automodel_args = {}
+        if config_args is None:
+            config_args = {}
         self.config = AutoConfig.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code, revision=revision, local_files_only=local_files_only
+            model_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            local_files_only=local_files_only,
+            cache_dir=cache_dir,
+            **config_args,
         )
         classifier_trained = True
         if self.config.architectures is not None:
@@ -96,6 +107,7 @@ class CrossEncoder(PushToHubMixin):
             revision=revision,
             trust_remote_code=trust_remote_code,
             local_files_only=local_files_only,
+            cache_dir=cache_dir,
             **automodel_args,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -103,6 +115,7 @@ class CrossEncoder(PushToHubMixin):
             revision=revision,
             local_files_only=local_files_only,
             trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
             **tokenizer_args,
         )
         self.max_length = max_length
@@ -110,8 +123,7 @@ class CrossEncoder(PushToHubMixin):
         if device is None:
             device = get_device_name()
             logger.info(f"Use pytorch device: {device}")
-
-        self._target_device = torch.device(device)
+        self.model.to(device)
 
         if default_activation_function is not None:
             self.default_activation_function = default_activation_function
@@ -141,11 +153,11 @@ class CrossEncoder(PushToHubMixin):
             *texts, padding=True, truncation="longest_first", return_tensors="pt", max_length=self.max_length
         )
         labels = torch.tensor(labels, dtype=torch.float if self.config.num_labels == 1 else torch.long).to(
-            self._target_device
+            self.model.device
         )
 
         for name in tokenized:
-            tokenized[name] = tokenized[name].to(self._target_device)
+            tokenized[name] = tokenized[name].to(self.model.device)
 
         return tokenized, labels
 
@@ -161,7 +173,7 @@ class CrossEncoder(PushToHubMixin):
         )
 
         for name in tokenized:
-            tokenized[name] = tokenized[name].to(self._target_device)
+            tokenized[name] = tokenized[name].to(self.model.device)
 
         return tokenized
 
@@ -219,7 +231,6 @@ class CrossEncoder(PushToHubMixin):
                 scaler = torch.npu.amp.GradScaler()
             else:
                 scaler = torch.cuda.amp.GradScaler()
-        self.model.to(self._target_device)
 
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
@@ -259,7 +270,7 @@ class CrossEncoder(PushToHubMixin):
                 train_dataloader, desc="Iteration", smoothing=0.05, disable=not show_progress_bar
             ):
                 if use_amp:
-                    with torch.autocast(device_type=self._target_device.type):
+                    with torch.autocast(device_type=self.model.device.type):
                         model_predictions = self.model(**features, return_dict=True)
                         logits = activation_fct(model_predictions.logits)
                         if self.config.num_labels == 1:
@@ -425,7 +436,6 @@ class CrossEncoder(PushToHubMixin):
 
         pred_scores = []
         self.model.eval()
-        self.model.to(self._target_device)
         with torch.no_grad():
             for features in iterator:
                 model_predictions = self.model(**features, return_dict=True)
@@ -517,9 +527,14 @@ class CrossEncoder(PushToHubMixin):
                 'score': -5.082967,
                 'text': "The 'Harry Potter' series, which consists of seven fantasy novels written by British author J.K. Rowling, is among the most popular and critically acclaimed books of the modern era."}]
         """
+        if self.config.num_labels != 1:
+            raise ValueError(
+                "CrossEncoder.rank() only works for models with num_labels=1. "
+                "Consider using CrossEncoder.predict() with input pairs instead."
+            )
         query_doc_pairs = [[query, doc] for doc in documents]
         scores = self.predict(
-            query_doc_pairs,
+            sentences=query_doc_pairs,
             batch_size=batch_size,
             show_progress_bar=show_progress_bar,
             num_workers=num_workers,
@@ -530,11 +545,10 @@ class CrossEncoder(PushToHubMixin):
         )
 
         results = []
-        for i in range(len(scores)):
+        for i, score in enumerate(scores):
+            results.append({"corpus_id": i, "score": score})
             if return_documents:
-                results.append({"corpus_id": i, "score": scores[i], "text": documents[i]})
-            else:
-                results.append({"corpus_id": i, "score": scores[i]})
+                results[-1].update({"text": documents[i]})
 
         results = sorted(results, key=lambda x: x["score"], reverse=True)
         return results[:top_k]
@@ -592,3 +606,21 @@ class CrossEncoder(PushToHubMixin):
             tags=tags,
             **kwargs,
         )
+
+    def to(self, device: int | str | torch.device | None = None) -> None:
+        return self.model.to(device)
+
+    @property
+    def _target_device(self) -> torch.device:
+        logger.warning(
+            "`CrossEncoder._target_device` has been removed, please use `CrossEncoder.device` instead.",
+        )
+        return self.device
+
+    @_target_device.setter
+    def _target_device(self, device: int | str | torch.device | None = None) -> None:
+        self.to(device)
+
+    @property
+    def device(self) -> torch.device:
+        return self.model.device

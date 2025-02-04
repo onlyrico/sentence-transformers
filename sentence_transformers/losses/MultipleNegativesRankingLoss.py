@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -48,22 +49,28 @@ class MultipleNegativesRankingLoss(nn.Module):
         Requirements:
             1. (anchor, positive) pairs or (anchor, positive, negative) triplets
 
+        Inputs:
+            +-------------------------------------------------+--------+
+            | Texts                                           | Labels |
+            +=================================================+========+
+            | (anchor, positive) pairs                        | none   |
+            +-------------------------------------------------+--------+
+            | (anchor, positive, negative) triplets           | none   |
+            +-------------------------------------------------+--------+
+            | (anchor, positive, negative_1, ..., negative_n) | none   |
+            +-------------------------------------------------+--------+
+
+        Recommendations:
+            - Use ``BatchSamplers.NO_DUPLICATES`` (:class:`docs <sentence_transformers.training_args.BatchSamplers>`) to
+              ensure that no in-batch negatives are duplicates of the anchor or positive samples.
+
         Relations:
             - :class:`CachedMultipleNegativesRankingLoss` is equivalent to this loss, but it uses caching that allows for
-              much higher batch sizes (and thus better performance) without extra memory usage. However, it requires more
-              training time.
+              much higher batch sizes (and thus better performance) without extra memory usage. However, it is slightly
+              slower.
             - :class:`MultipleNegativesSymmetricRankingLoss` is equivalent to this loss, but with an additional loss term.
             - :class:`GISTEmbedLoss` is equivalent to this loss, but uses a guide model to guide the in-batch negative
               sample selection. `GISTEmbedLoss` yields a stronger training signal at the cost of some training overhead.
-
-        Inputs:
-            +---------------------------------------+--------+
-            | Texts                                 | Labels |
-            +=======================================+========+
-            | (anchor, positive) pairs              | none   |
-            +---------------------------------------+--------+
-            | (anchor, positive, negative) triplets | none   |
-            +---------------------------------------+--------+
 
         Example:
             ::
@@ -92,13 +99,20 @@ class MultipleNegativesRankingLoss(nn.Module):
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        reps = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
-        embeddings_a = reps[0]
-        embeddings_b = torch.cat(reps[1:])
+        # Compute the embeddings and distribute them to anchor and candidates (positive and optionally negatives)
+        embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
+        anchors = embeddings[0]  # (batch_size, embedding_dim)
+        candidates = torch.cat(embeddings[1:])  # (batch_size * (1 + num_negatives), embedding_dim)
 
-        scores = self.similarity_fct(embeddings_a, embeddings_b) * self.scale
-        # Example a[i] should match with b[i]
+        # For every anchor, we compute the similarity to all other candidates (positives and negatives),
+        # also from other anchors. This gives us a lot of in-batch negatives.
+        scores = self.similarity_fct(anchors, candidates) * self.scale
+        # (batch_size, batch_size * (1 + num_negatives))
+
+        # anchor[i] should be most similar to candidates[i], as that is the paired positive,
+        # so the label for anchor[i] is i
         range_labels = torch.arange(0, scores.size(0), device=scores.device)
+
         return self.cross_entropy_loss(scores, range_labels)
 
     def get_config_dict(self) -> dict[str, Any]:
